@@ -1,0 +1,21 @@
+# Dados extraídos (não versionar)
+dados*/
+*.csv
+*.json
+*.zip
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# macOS
+.DS_Store
+
+# Streamlit cache
+.streamlit/secrets.toml

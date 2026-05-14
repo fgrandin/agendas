@@ -8,6 +8,7 @@ import re
 import time
 import json
 import zipfile
+from datetime import date, timedelta
 import streamlit as st
 import pandas as pd
 
@@ -18,6 +19,7 @@ from scraper import (
     resolve_official,
     extract_events,
     event_to_record,
+    filter_by_date,
     parse_ng_init_json,
     BASE_URL,
 )
@@ -94,6 +96,24 @@ with st.sidebar:
     )
 
     excluir_viagens = st.checkbox("Excluir viagens SCDP", value=False)
+
+    st.divider()
+    st.subheader("Filtro de data")
+
+    amanha = date.today() + timedelta(days=1)
+    opcao_data = st.radio(
+        "Período",
+        ["Todos os dias disponíveis", "Apenas amanhã", "Data específica"],
+        index=0,
+    )
+
+    if opcao_data == "Apenas amanhã":
+        data_alvo = amanha
+        st.caption(f"📅 Amanhã: **{amanha.strftime('%d/%m/%Y')}**")
+    elif opcao_data == "Data específica":
+        data_alvo = st.date_input("Escolha a data", value=amanha, format="DD/MM/YYYY")
+    else:
+        data_alvo = None
 
     st.divider()
     executar = st.button("▶ Extrair agendas", type="primary", use_container_width=True)
@@ -239,6 +259,16 @@ if executar:
         before = len(all_records)
         all_records = [r for r in all_records if r.get("tipo") != "Viagem SCDP"]
         st.caption(f"{before - len(all_records)} viagens SCDP excluídas")
+
+    if data_alvo:
+        total_antes = len(all_records)
+        all_records = filter_by_date(all_records, data_alvo)
+        label = "amanhã" if data_alvo == amanha else data_alvo.strftime("%d/%m/%Y")
+        if all_records:
+            st.success(f"📅 {len(all_records)} compromisso(s) encontrado(s) para **{label}** (de {total_antes} eventos no total)")
+        else:
+            st.warning(f"Nenhum compromisso encontrado para **{label}**. A agenda pode ainda não ter sido publicada.")
+            st.stop()
 
     if not all_records:
         st.warning("Nenhum evento encontrado com os parâmetros informados.")

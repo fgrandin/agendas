@@ -16,7 +16,7 @@ import time
 import argparse
 import sys
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta, date
 from urllib.parse import urlencode, urlparse, parse_qs, unquote
 
 try:
@@ -253,6 +253,15 @@ def event_to_record(event, orgao_nome="", orgao_sigla=""):
     return base
 
 
+def filter_by_date(records, target_date):
+    """
+    Filtra registros pelo dia exato de data_inicio.
+    target_date: objeto date ou string "YYYY-MM-DD".
+    """
+    prefix = target_date.isoformat() if isinstance(target_date, date) else target_date
+    return [r for r in records if r.get("data_inicio", "").startswith(prefix)]
+
+
 def get_officials_from_govbr(session, govbr_url, delay=DEFAULT_DELAY):
     """
     Extrai links de eagendas da página de agendas do gov.br de um ministério.
@@ -407,6 +416,16 @@ Exemplos:
         default=0,
         help="Limita o número de autoridades processadas (0 = sem limite, útil para testes)",
     )
+    parser.add_argument(
+        "--amanha",
+        action="store_true",
+        help="Extrai apenas compromissos do dia seguinte à execução",
+    )
+    parser.add_argument(
+        "--data",
+        default=None,
+        help="Filtra por uma data específica no formato YYYY-MM-DD (ex: 2026-05-15)",
+    )
 
     args = parser.parse_args()
 
@@ -471,9 +490,29 @@ Exemplos:
         all_records = [r for r in all_records if r.get("tipo") != "Viagem SCDP"]
         print(f"Viagens excluídas: {before - len(all_records)} registros removidos")
 
+    # Filtra por data
+    target_date = None
+    if args.amanha and args.data:
+        parser.error("Use --amanha ou --data, não ambos ao mesmo tempo")
+    elif args.amanha:
+        target_date = date.today() + timedelta(days=1)
+        print(f"Filtrando compromissos de amanhã: {target_date.strftime('%d/%m/%Y')}")
+    elif args.data:
+        try:
+            target_date = date.fromisoformat(args.data)
+            print(f"Filtrando compromissos de: {target_date.strftime('%d/%m/%Y')}")
+        except ValueError:
+            parser.error(f"Data inválida '{args.data}'. Use o formato YYYY-MM-DD (ex: 2026-05-15)")
+
+    if target_date:
+        before = len(all_records)
+        all_records = filter_by_date(all_records, target_date)
+        print(f"  {len(all_records)} compromisso(s) encontrado(s) (de {before} no total)")
+
     # Salva arquivo consolidado
     if all_records:
-        prefix = "agenda_consolidada"
+        date_suffix = f"_{target_date.isoformat()}" if target_date else ""
+        prefix = f"agenda{date_suffix}"
         if "csv" in formatos:
             save_csv(all_records, output_dir / f"{prefix}_{timestamp}.csv")
         if "json" in formatos:
@@ -481,7 +520,8 @@ Exemplos:
 
         print(f"\nTotal: {len(all_records)} eventos extraídos")
     else:
-        print("Nenhum evento extraído.", file=sys.stderr)
+        msg = f"Nenhum compromisso encontrado para {target_date.strftime('%d/%m/%Y')}." if target_date else "Nenhum evento extraído."
+        print(msg, file=sys.stderr)
         sys.exit(1)
 
 
