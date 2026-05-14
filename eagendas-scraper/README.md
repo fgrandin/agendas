@@ -1,6 +1,6 @@
 # 📅 e-Agendas Scraper
 
-Extrai e explora agendas públicas de autoridades do Governo Federal disponíveis no [e-Agendas (CGU)](https://eagendas.cgu.gov.br).
+Extrai e explora agendas públicas de autoridades do Governo Federal. Combina dados do [e-Agendas (CGU)](https://eagendas.cgu.gov.br) com a agenda do Presidente da República disponível no [Planalto](https://www.gov.br/planalto).
 
 Funciona de três formas: **interface web no browser**, **linha de comando** ou **Docker** (sem instalar Python).
 
@@ -38,6 +38,12 @@ Acesse `http://localhost:8501` no browser.
 ```bash
 pip install requests
 
+# Presidente + todos os ministros + Vice-Presidente (amanhã)
+python scraper.py --ministros --data amanha --output-dir ./dados
+
+# Presidente + todos os ministros + Vice-Presidente (data específica)
+python scraper.py --ministros --data 2026-05-14 --output-dir ./dados
+
 # Extrair todas as autoridades de um ministério
 python scraper.py \
   --govbr-url "https://www.gov.br/mme/pt-br/acesso-a-informacao/agendas-de-autoridades" \
@@ -60,9 +66,11 @@ python scraper.py \
 
 | Argumento | Descrição | Padrão |
 |---|---|---|
+| `--ministros` | Busca Presidente + todos os ministros + Vice-Presidente de uma vez | — |
 | `--govbr-url` | URL da página de agendas no gov.br de um ministério | — |
 | `--eagendas-url` | URL direta de um oficial no e-Agendas | — |
 | `--servidor-id` | ID interno do servidor (requer `--orgao-id` e `--cargo`) | — |
+| `--data` | Filtra por data: `hoje`, `amanha` ou `YYYY-MM-DD` | — |
 | `--output-dir` | Diretório de saída | `./dados` |
 | `--formato` | Formatos: `csv`, `json` ou `csv,json` | `csv,json` |
 | `--delay` | Segundos entre requisições | `1.5` |
@@ -132,6 +140,7 @@ Cada evento exportado contém:
 
 ## Notas
 
+- A agenda do **Presidente da República** é extraída de [planalto.gov.br](https://www.gov.br/planalto) (não está no e-Agendas) e sempre requer uma data específica.
 - Nem todas as autoridades listadas no gov.br têm agenda cadastrada no e-Agendas (apenas "Agentes Públicos Obrigados"). O scraper identifica e pula esses casos automaticamente.
-- Todos os dados extraídos são **públicos** e estão disponíveis em [eagendas.cgu.gov.br](https://eagendas.cgu.gov.br).
-- Use um delay razoável (`--delay 1.5` ou maior) para não sobrecarregar o servidor da CGU.
+- Todos os dados extraídos são **públicos**: [eagendas.cgu.gov.br](https://eagendas.cgu.gov.br) e [planalto.gov.br](https://www.gov.br/planalto).
+- Use um delay razoável (`--delay 1.5` ou maior) para não sobrecarregar os servidores.
