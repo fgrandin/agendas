@@ -29,6 +29,12 @@ except ImportError:
 BASE_URL = "https://eagendas.cgu.gov.br"
 DEFAULT_DELAY = 1.5  # segundos entre requisições
 
+PLANALTO_BASE = (
+    "https://www.gov.br/planalto/pt-br/acompanhe-o-planalto"
+    "/agenda-do-presidente-da-republica-lula"
+    "/agenda-do-presidente-da-republica"
+)
+
 
 def build_session():
     session = requests.Session()
@@ -400,9 +406,75 @@ def _fetch_minister_for_org(org, target_date, delay):
     return nome_oficial or org_nome, records
 
 
+def scrape_president_agenda(session, target_date=None):
+    """
+    Busca a agenda do Presidente da República no planalto.gov.br.
+    target_date: objeto date ou string YYYY-MM-DD. Se None, usa hoje.
+    Retorna lista de records no mesmo formato do e-Agendas.
+    """
+    if target_date is None:
+        target_date = date.today()
+    if isinstance(target_date, str):
+        target_date = date.fromisoformat(target_date)
+
+    date_str = target_date.isoformat()
+    url = f"{PLANALTO_BASE}/{date_str}"
+
+    html = fetch_page(session, url, timeout=15)
+    if not html:
+        return []
+
+    blocks = re.findall(
+        r'<li class="item-compromisso-wrapper">(.*?)</li>',
+        html,
+        re.DOTALL,
+    )
+    if not blocks:
+        return []
+
+    records = []
+    for block in blocks:
+        inicio_m = re.search(r'<time class="compromisso-inicio">([^<]+)</time>', block)
+        titulo_m = re.search(r'<h2 class="compromisso-titulo">([^<]+)</h2>', block)
+        local_m = re.search(r'<div class="compromisso-local">([^<]+)</div>', block)
+        vcal_m = re.search(r'href="([^"]+/vcal_view)"', block)
+
+        hora_str = inicio_m.group(1).strip() if inicio_m else ""
+        titulo = titulo_m.group(1).strip() if titulo_m else ""
+        local = local_m.group(1).strip() if local_m else ""
+        url_vcal = vcal_m.group(1).replace("/vcal_view", "") if vcal_m else url
+
+        # Converte "08h00" → "08:00"
+        hora_iso = hora_str.replace("h", ":") if hora_str else ""
+        data_inicio = f"{date_str}T{hora_iso}:00" if hora_iso else date_str
+
+        records.append({
+            "tipo": "Compromisso",
+            "titulo": titulo,
+            "data_inicio": data_inicio,
+            "data_fim": "",
+            "local": local,
+            "agenda_de": "LUIZ INÁCIO LULA DA SILVA",
+            "cargo_oficial": "PRESIDENTE DA REPÚBLICA",
+            "orgao": "Presidência da República",
+            "orgao_sigla": "PR",
+            "compromisso_id": "",
+            "publicado_em": "",
+            "modificado_em": "",
+            "agentes_publicos": "",
+            "agentes_privados": "",
+            "url_compromisso": url_vcal,
+            "pertenencia_id": "",
+            "nome_oficial": "LUIZ INÁCIO LULA DA SILVA",
+            "tipo_exercicio": "",
+        })
+
+    return records
+
+
 def scrape_all_ministers(target_date=None, max_workers=3, delay=0.4, progress_cb=None):
     """
-    Busca a agenda de todos os ministros + Vice-Presidente em paralelo.
+    Busca a agenda do Presidente + todos os ministros + Vice-Presidente em paralelo.
     Retorna lista consolidada de records.
     """
     session = build_session()
@@ -410,8 +482,14 @@ def scrape_all_ministers(target_date=None, max_workers=3, delay=0.4, progress_cb
     if not orgs:
         return []
 
-    all_records = []
+    # Presidente da República (planalto.gov.br — não está no e-Agendas)
+    pres_date = target_date if target_date else date.today()
+    pres_records = scrape_president_agenda(session, pres_date)
+    pres_label = "LUIZ INÁCIO LULA DA SILVA"
+    all_records = list(pres_records)
     total = len(orgs)
+    if progress_cb:
+        progress_cb(pres_label, len(pres_records), 0, total)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_org = {
@@ -753,10 +831,10 @@ Exemplos:
         official = {"url": url, "nome": "", "cargo": args.cargo}
         all_records = scrape_official(session, official, delay=args.delay)
 
-    # Modo 4: Todos os ministros + Vice-Presidente
+    # Modo 4: Presidente + todos os ministros + Vice-Presidente
     elif args.ministros:
         label = f"de {target_date.strftime('%d/%m/%Y')}" if target_date else "completa"
-        print(f"Buscando agenda {label} de todos os ministros + Vice-Presidente...")
+        print(f"Buscando agenda {label} de Presidente + ministros + Vice-Presidente...")
 
         def cli_progress(nome, encontrados, concluidos, total):
             icon = "✓" if encontrados else "·"

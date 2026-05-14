@@ -17,6 +17,7 @@ from scraper import (
     get_officials_from_govbr,
     scrape_official,
     scrape_officials_parallel,
+    scrape_all_ministers,
     resolve_official,
     extract_events,
     event_to_record,
@@ -49,32 +50,40 @@ with st.sidebar:
 
     modo = st.radio(
         "Como deseja buscar?",
-        ["Por ministério (gov.br)", "Por URL do e-Agendas", "Por ID interno"],
+        [
+            "🇧🇷 Presidente + todos os ministros + Vice-Presidente",
+            "Por ministério (gov.br)",
+            "Por URL do e-Agendas",
+            "Por ID interno",
+        ],
         index=0,
     )
 
-    if modo == "Por ministério (gov.br)":
+    todos_ministros = False
+    govbr_url = eagendas_url = None
+    servidor_id = orgao_id = cargo = None
+
+    if modo == "🇧🇷 Presidente + todos os ministros + Vice-Presidente":
+        todos_ministros = True
+        st.caption("Busca automaticamente o Presidente da República + todos os ministérios + Vice-Presidência.")
+
+    elif modo == "Por ministério (gov.br)":
         govbr_url = st.text_input(
             "URL da página de agendas no gov.br",
             value="https://www.gov.br/mme/pt-br/acesso-a-informacao/agendas-de-autoridades",
             help="Exemplo: https://www.gov.br/mme/pt-br/acesso-a-informacao/agendas-de-autoridades",
         )
-        eagendas_url = None
-        servidor_id = orgao_id = cargo = None
 
     elif modo == "Por URL do e-Agendas":
         eagendas_url = st.text_input(
             "URL do e-Agendas",
             placeholder="https://eagendas.cgu.gov.br?filtro_codigo_orgao=...",
         )
-        govbr_url = None
-        servidor_id = orgao_id = cargo = None
 
     else:
         servidor_id = st.number_input("ID do servidor", min_value=1, step=1)
         orgao_id = st.number_input("ID do órgão", min_value=1, step=1)
         cargo = st.text_input("Cargo", placeholder="MINISTRO DE MINAS E ENERGIA")
-        govbr_url = eagendas_url = None
 
     st.divider()
     st.subheader("Opções")
@@ -191,8 +200,40 @@ if executar:
     session = build_session()
     all_records: list[dict] = []
 
+    # ── Modo todos os ministros ───────────────────────────────────────────────
+    if todos_ministros:
+        label_data = f"de **{data_alvo.strftime('%d/%m/%Y')}**" if data_alvo else "completa"
+        st.info(f"Buscando agenda {label_data} de Presidente + ministros + Vice-Presidente em paralelo...")
+
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        log_expander = st.expander("Ver progresso por ministério", expanded=False)
+        log_lines = []
+        log_placeholder = log_expander.empty()
+
+        def minister_progress(nome, encontrados, concluidos, total_off):
+            icon = "📅" if encontrados else "·"
+            entry = f"{icon} **{nome}**"
+            if encontrados:
+                entry += f" — {encontrados} compromisso(s)"
+            log_lines.append(entry)
+            log_placeholder.markdown("\n\n".join(log_lines))
+            progress_bar.progress(concluidos / total_off)
+            status_text.markdown(f"⚡ Processando ministérios... ({concluidos}/{total_off})")
+
+        all_records = scrape_all_ministers(
+            target_date=data_alvo,
+            delay=0.4,
+            progress_cb=minister_progress,
+        )
+        n = len(all_records)
+        if data_alvo:
+            status_text.markdown(f"✅ Concluído! **{n}** compromisso(s) encontrado(s) para {data_alvo.strftime('%d/%m/%Y')}.")
+        else:
+            status_text.markdown(f"✅ Concluído! **{n}** eventos extraídos de todos os ministérios.")
+
     # ── Modo gov.br ──────────────────────────────────────────────────────────
-    if govbr_url:
+    elif govbr_url:
         with st.spinner("Buscando lista de autoridades no gov.br..."):
             officials = get_officials_from_govbr(session, govbr_url, delay=0)
 
@@ -292,8 +333,11 @@ if executar:
         all_records = [r for r in all_records if r.get("tipo") != "Viagem SCDP"]
         st.caption(f"{before - len(all_records)} viagens SCDP excluídas")
 
-    if data_alvo and not govbr_url:
-        # Para URL direta e ID, o filtro ainda não foi aplicado — aplica agora
+    # Modos que já filtram por data nas threads (paralelo): todos_ministros, govbr_url com data_alvo
+    already_filtered = todos_ministros or (govbr_url and data_alvo)
+
+    if data_alvo and not already_filtered:
+        # URL direta ou ID: aplica filtro agora
         total_antes = len(all_records)
         all_records = filter_by_date(all_records, data_alvo)
         label = "amanhã" if data_alvo == amanha else data_alvo.strftime("%d/%m/%Y")
@@ -302,7 +346,7 @@ if executar:
         else:
             st.warning(f"Nenhum compromisso encontrado para **{label}**. A agenda pode ainda não ter sido publicada.")
             st.stop()
-    elif data_alvo and govbr_url and not all_records:
+    elif data_alvo and already_filtered and not all_records:
         label = "amanhã" if data_alvo == amanha else data_alvo.strftime("%d/%m/%Y")
         st.warning(f"Nenhum compromisso encontrado para **{label}**. A agenda pode ainda não ter sido publicada.")
         st.stop()
