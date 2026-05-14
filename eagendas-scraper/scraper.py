@@ -107,20 +107,24 @@ def parse_detalhe(detalhe_html):
     return public_agents, private_agents
 
 
-def fetch_page(session, url, delay=0):
+def fetch_page(session, url, delay=0, timeout=30):
     """Faz GET com retry simples e delay opcional."""
     if delay:
         time.sleep(delay)
-    for attempt in range(3):
+    for attempt in range(2):
         try:
-            resp = session.get(url, timeout=30)
+            resp = session.get(url, timeout=timeout)
             resp.raise_for_status()
             return resp.text
+        except requests.exceptions.Timeout as e:
+            # Timeout: não tem sentido ficar tentando — falha rápido
+            print(f"  [ERRO] {url}: {e}", file=sys.stderr)
+            return None
         except requests.RequestException as e:
-            if attempt == 2:
+            if attempt == 1:
                 print(f"  [ERRO] {url}: {e}", file=sys.stderr)
                 return None
-            time.sleep(2 ** attempt)
+            time.sleep(2)
     return None
 
 
@@ -252,6 +256,177 @@ def event_to_record(event, orgao_nome="", orgao_sigla=""):
         })
 
     return base
+
+
+# Padrão para identificar cargo de nível ministerial / vice-presidencial
+_MINISTER_RE = re.compile(
+    r"^(MINISTRO|MINISTRA|VICE-PRESIDENTE)\b",
+    re.IGNORECASE,
+)
+
+# IDs de órgãos que NÃO são ministérios mas são administração direta
+# (presidência, comandos militares, polícias, etc.) — excluídos por default
+_NON_MINISTRY_SIGLAS = {
+    "PR", "COMAER", "MB", "CEX", "HFA", "PF", "PRF", "UFNT",
+    "CC-PR", "GSI/PR", "CGU", "AGU", "SECOM", "SG", "SRI/PR",
+    "SERS",
+}
+
+
+def get_all_orgs(session):
+    """Retorna lista de todos os órgãos do eagendas (embedding na página principal)."""
+    html = fetch_page(session, BASE_URL + "/")
+    if not html:
+        return []
+    return parse_ng_init_json(html, "orgaos") or []
+
+
+def get_ministerial_orgs(session):
+    """
+    Retorna lista de órgãos-alvo: ministérios + Vice-Presidência da República.
+    O Presidente da República não publica agenda no e-Agendas.
+    """
+    orgs = get_all_orgs(session)
+    targets = []
+    for o in orgs:
+        if not o.get("activa"):
+            continue
+        sigla = o.get("sigla", "")
+        nome = o.get("nome", "")
+        # Vice-Presidência sempre inclui
+        if sigla == "VPR":
+            targets.append(o)
+        # Ministérios (têm "Ministério" no nome, administração direta)
+        elif o.get("administracao_direta") and "Ministério" in nome:
+            targets.append(o)
+    return targets
+
+
+def fetch_org_cargos(session, org_id, delay=0.3):
+    """Busca a lista de cargos de um órgão específico."""
+    url = (
+        f"{BASE_URL}/?filtro_orgaos_ativos=on&filtro_orgao={org_id}"
+        f"&filtro_cargos_ativos=on&filtro_apos_ativos=on"
+    )
+    html = fetch_page(session, url, delay=delay, timeout=10)
+    if not html:
+        return []
+    return parse_ng_init_json(html, "cargos") or []
+
+
+def find_minister_cargo(cargos):
+    """Encontra o cargo de nível ministerial/vice-presidencial na lista."""
+    matches = [c for c in cargos if _MINISTER_RE.match(c.get("nome", ""))]
+    if not matches:
+        return None
+    # Prefere cargos sem data_termino (ainda vigente) e de nome mais curto
+    active = [c for c in matches if not c.get("data_termino")]
+    pool = active if active else matches
+    return min(pool, key=lambda c: len(c["nome"]))
+
+
+def fetch_org_servidores(session, org_id, cargo_nome, delay=0.3):
+    """Busca os servidores de um órgão para um cargo específico."""
+    url = (
+        f"{BASE_URL}/?filtro_orgaos_ativos=on&filtro_orgao={org_id}"
+        f"&filtro_cargos_ativos=on&filtro_cargo={requests.utils.quote(cargo_nome)}"
+        f"&filtro_apos_ativos=on"
+    )
+    html = fetch_page(session, url, delay=delay, timeout=10)
+    if not html:
+        return [], html
+    servidores = parse_ng_init_json(html, "servidores") or []
+    return servidores, html
+
+
+def _fetch_minister_for_org(org, target_date, delay):
+    """
+    Worker: encadeia as 3 requisições necessárias para um órgão,
+    retorna (label, records).
+    """
+    session = build_session()
+    org_id = org["id"]
+    org_nome = org.get("nome", "")
+
+    # 1. Cargos do órgão
+    cargos = fetch_org_cargos(session, org_id, delay=delay)
+    cargo_obj = find_minister_cargo(cargos)
+    if not cargo_obj:
+        return org_nome, []
+
+    cargo_nome = cargo_obj["nome"]
+
+    # 2. Servidores para o cargo
+    servidores, _ = fetch_org_servidores(session, org_id, cargo_nome, delay=delay)
+    servidor = next(
+        (s for s in servidores if s.get("pertenencia_id") and s.get("pertenencia_id") != -1),
+        None,
+    )
+    if not servidor:
+        return org_nome, []
+
+    pertenencia_id = servidor["pertenencia_id"]
+    nome_oficial = servidor.get("nome", "")
+    orgao_nome = servidor.get("orgao", org_nome)
+    orgao_sigla = servidor.get("sigla", org.get("sigla", ""))
+
+    # 3. Eventos do oficial
+    params = {
+        "filtro_orgaos_ativos": "on",
+        "filtro_orgao": str(org_id),
+        "filtro_cargos_ativos": "on",
+        "filtro_cargo": cargo_nome,
+        "filtro_apos_ativos": "on",
+        "filtro_servidor": str(pertenencia_id),
+        "cargo_confianca_id": "",
+        "is_cargo_vago": "false",
+    }
+    html_events = fetch_page(session, f"{BASE_URL}/?{urlencode(params)}", delay=delay)
+    if not html_events:
+        return nome_oficial or org_nome, []
+
+    events = parse_ng_init_json(html_events, "events") or []
+    records = []
+    for event in events:
+        record = event_to_record(event, orgao_nome=orgao_nome, orgao_sigla=orgao_sigla)
+        record["pertenencia_id"] = str(pertenencia_id)
+        record["cargo_oficial"] = cargo_nome
+        record["nome_oficial"] = nome_oficial
+        records.append(record)
+
+    if target_date:
+        records = filter_by_date(records, target_date)
+
+    return nome_oficial or org_nome, records
+
+
+def scrape_all_ministers(target_date=None, max_workers=3, delay=0.4, progress_cb=None):
+    """
+    Busca a agenda de todos os ministros + Vice-Presidente em paralelo.
+    Retorna lista consolidada de records.
+    """
+    session = build_session()
+    orgs = get_ministerial_orgs(session)
+    if not orgs:
+        return []
+
+    all_records = []
+    total = len(orgs)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_org = {
+            executor.submit(_fetch_minister_for_org, org, target_date, delay): org
+            for org in orgs
+        }
+        concluidos = 0
+        for future in as_completed(future_to_org):
+            nome, records = future.result()
+            all_records.extend(records)
+            concluidos += 1
+            if progress_cb:
+                progress_cb(nome, len(records), concluidos, total)
+
+    return all_records
 
 
 def filter_by_date(records, target_date):
@@ -446,6 +621,11 @@ Exemplos:
         type=int,
         help="ID interno do servidor no e-Agendas (requer --orgao-id e --cargo)",
     )
+    source.add_argument(
+        "--ministros",
+        action="store_true",
+        help="Busca todos os ministros + Vice-Presidente da República de uma vez",
+    )
 
     parser.add_argument("--orgao-id", type=int, help="ID do órgão no e-Agendas (ex: 661 para MME)")
     parser.add_argument("--cargo", help="Cargo do servidor (ex: 'MINISTRO DE MINAS E ENERGIA')")
@@ -573,15 +753,32 @@ Exemplos:
         official = {"url": url, "nome": "", "cargo": args.cargo}
         all_records = scrape_official(session, official, delay=args.delay)
 
+    # Modo 4: Todos os ministros + Vice-Presidente
+    elif args.ministros:
+        label = f"de {target_date.strftime('%d/%m/%Y')}" if target_date else "completa"
+        print(f"Buscando agenda {label} de todos os ministros + Vice-Presidente...")
+
+        def cli_progress(nome, encontrados, concluidos, total):
+            icon = "✓" if encontrados else "·"
+            suffix = f"{encontrados} compromisso(s)" if encontrados else "sem eventos"
+            print(f"  [{concluidos:2d}/{total}] {icon} {nome}: {suffix}")
+
+        all_records = scrape_all_ministers(
+            target_date=target_date,
+            delay=0.4,
+            progress_cb=cli_progress,
+        )
+
     # Filtra viagens se pedido
     if args.sem_viagens:
         before = len(all_records)
         all_records = [r for r in all_records if r.get("tipo") != "Viagem SCDP"]
         print(f"Viagens excluídas: {before - len(all_records)} registros removidos")
 
-    # Para modos 2 e 3 (URL direta / ID), ainda aplica filtro de data pós-extração
-    # (modo 1 com target_date já filtra dentro de scrape_officials_parallel)
-    if target_date and not args.govbr_url:
+    # Para modos 2, 3 (URL direta / ID): aplica filtro de data pós-extração
+    # Modos 1 e 4 com target_date já filtram dentro das threads
+    uses_parallel_date_filter = (args.govbr_url and target_date) or getattr(args, "ministros", False)
+    if target_date and not uses_parallel_date_filter:
         before = len(all_records)
         all_records = filter_by_date(all_records, target_date)
         print(f"Filtrando {target_date.strftime('%d/%m/%Y')}: {len(all_records)} compromisso(s) (de {before} no total)")
