@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "eagendas-scraper"
+version = "0.1.0"
+description = "Extrator de agendas de autoridades do Governo Federal (e-Agendas CGU)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["governo", "transparência", "agendas", "CGU", "scraper"]
+dependencies = [
+    "requests>=2.28.0",
+]
+
+[project.optional-dependencies]
+web = ["streamlit>=1.35.0", "pandas>=2.0.0"]
+
+[project.scripts]
+eagendas = "scraper:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["scraper*"]
