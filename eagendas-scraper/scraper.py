@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 from datetime import datetime, timedelta, date
 from urllib.parse import urlencode, urlparse, parse_qs, unquote
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     import requests
@@ -342,6 +343,65 @@ def scrape_official(session, official_info, delay=DEFAULT_DELAY):
     return records
 
 
+def _fetch_one_official(official_info, target_date, delay):
+    """Worker executado em thread separada: cria sua própria sessão e retorna
+    apenas os registros que batem com target_date (ou todos se None)."""
+    session = build_session()
+    url = official_info.get("url", "")
+    nome = official_info.get("nome", "")
+    cargo = official_info.get("cargo", "")
+
+    result = resolve_official(session, url, delay=delay)
+    if not result:
+        return nome or cargo, []
+
+    events = extract_events(result["html"])
+
+    servidores = parse_ng_init_json(result["html"], "servidores")
+    orgao_nome = orgao_sigla = ""
+    if servidores and servidores[0]:
+        orgao_nome = servidores[0].get("orgao", "")
+        orgao_sigla = servidores[0].get("sigla", "")
+
+    records = []
+    for event in events:
+        record = event_to_record(event, orgao_nome=orgao_nome, orgao_sigla=orgao_sigla)
+        record["pertenencia_id"] = result["pertenencia_id"]
+        record["cargo_oficial"] = result.get("cargo", cargo)
+        record["nome_oficial"] = result.get("nome", nome)
+        records.append(record)
+
+    if target_date:
+        records = filter_by_date(records, target_date)
+
+    return nome or cargo, records
+
+
+def scrape_officials_parallel(officials, target_date=None, max_workers=6, delay=0.5, progress_cb=None):
+    """
+    Busca múltiplos oficiais em paralelo.
+    progress_cb(nome, n_encontrados, concluidos, total) é chamado após cada oficial terminar.
+    Retorna lista consolidada de records.
+    """
+    all_records = []
+    total = len(officials)
+    concluidos = 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_official = {
+            executor.submit(_fetch_one_official, off, target_date, delay): off
+            for off in officials
+        }
+        for future in as_completed(future_to_official):
+            nome, records = future.result()
+            all_records.extend(records)
+            concluidos += 1
+            if progress_cb:
+                progress_cb(nome, len(records), concluidos, total)
+
+    return all_records
+
+
 def save_csv(records, path):
     """Salva registros em CSV."""
     if not records:
@@ -441,6 +501,19 @@ Exemplos:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     all_records = []
 
+    # Resolve filtro de data cedo para decidir estratégia de busca
+    if args.amanha and args.data:
+        parser.error("Use --amanha ou --data, não ambos ao mesmo tempo")
+
+    target_date = None
+    if args.amanha:
+        target_date = date.today() + timedelta(days=1)
+    elif args.data:
+        try:
+            target_date = date.fromisoformat(args.data)
+        except ValueError:
+            parser.error(f"Data inválida '{args.data}'. Use YYYY-MM-DD (ex: 2026-05-15)")
+
     # Modo 1: Gov.br → extrai lista de autoridades
     if args.govbr_url:
         officials = get_officials_from_govbr(session, args.govbr_url, delay=args.delay)
@@ -452,16 +525,32 @@ Exemplos:
             officials = officials[: args.limite]
             print(f"Limitado a {args.limite} autoridade(s)")
 
-        for official in officials:
-            records = scrape_official(session, official, delay=args.delay)
-            if records:
-                all_records.extend(records)
-                # Salva arquivo individual por oficial
-                safe_name = re.sub(r"[^\w\-]", "_", official.get("nome", official.get("cargo", "oficial")))
-                if "csv" in formatos:
-                    save_csv(records, output_dir / f"{safe_name}.csv")
-                if "json" in formatos:
-                    save_json(records, output_dir / f"{safe_name}.json")
+        if target_date:
+            # Modo paralelo: busca todos simultaneamente, filtrando por data em cada thread
+            print(f"Buscando compromissos de {target_date.strftime('%d/%m/%Y')} em paralelo ({len(officials)} autoridades)...")
+
+            def cli_progress(nome, encontrados, concluidos, total):
+                status = f"✓ {encontrados} compromisso(s)" if encontrados else "  sem eventos"
+                print(f"  [{concluidos}/{total}] {nome or '—'}: {status}")
+
+            all_records = scrape_officials_parallel(
+                officials,
+                target_date=target_date,
+                max_workers=6,
+                delay=0.3,
+                progress_cb=cli_progress,
+            )
+        else:
+            # Modo sequencial completo com arquivos individuais por oficial
+            for official in officials:
+                records = scrape_official(session, official, delay=args.delay)
+                if records:
+                    all_records.extend(records)
+                    safe_name = re.sub(r"[^\w\-]", "_", official.get("nome", official.get("cargo", "oficial")))
+                    if "csv" in formatos:
+                        save_csv(records, output_dir / f"{safe_name}.csv")
+                    if "json" in formatos:
+                        save_json(records, output_dir / f"{safe_name}.json")
 
     # Modo 2: URL direta do eagendas
     elif args.eagendas_url:
@@ -490,24 +579,12 @@ Exemplos:
         all_records = [r for r in all_records if r.get("tipo") != "Viagem SCDP"]
         print(f"Viagens excluídas: {before - len(all_records)} registros removidos")
 
-    # Filtra por data
-    target_date = None
-    if args.amanha and args.data:
-        parser.error("Use --amanha ou --data, não ambos ao mesmo tempo")
-    elif args.amanha:
-        target_date = date.today() + timedelta(days=1)
-        print(f"Filtrando compromissos de amanhã: {target_date.strftime('%d/%m/%Y')}")
-    elif args.data:
-        try:
-            target_date = date.fromisoformat(args.data)
-            print(f"Filtrando compromissos de: {target_date.strftime('%d/%m/%Y')}")
-        except ValueError:
-            parser.error(f"Data inválida '{args.data}'. Use o formato YYYY-MM-DD (ex: 2026-05-15)")
-
-    if target_date:
+    # Para modos 2 e 3 (URL direta / ID), ainda aplica filtro de data pós-extração
+    # (modo 1 com target_date já filtra dentro de scrape_officials_parallel)
+    if target_date and not args.govbr_url:
         before = len(all_records)
         all_records = filter_by_date(all_records, target_date)
-        print(f"  {len(all_records)} compromisso(s) encontrado(s) (de {before} no total)")
+        print(f"Filtrando {target_date.strftime('%d/%m/%Y')}: {len(all_records)} compromisso(s) (de {before} no total)")
 
     # Salva arquivo consolidado
     if all_records:
@@ -518,7 +595,7 @@ Exemplos:
         if "json" in formatos:
             save_json(all_records, output_dir / f"{prefix}_{timestamp}.json")
 
-        print(f"\nTotal: {len(all_records)} eventos extraídos")
+        print(f"\nTotal: {len(all_records)} compromisso(s) extraído(s)")
     else:
         msg = f"Nenhum compromisso encontrado para {target_date.strftime('%d/%m/%Y')}." if target_date else "Nenhum evento extraído."
         print(msg, file=sys.stderr)

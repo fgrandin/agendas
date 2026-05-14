@@ -16,6 +16,7 @@ from scraper import (
     build_session,
     get_officials_from_govbr,
     scrape_official,
+    scrape_officials_parallel,
     resolve_official,
     extract_events,
     event_to_record,
@@ -202,31 +203,62 @@ if executar:
         if limite:
             officials = officials[:limite]
 
-        st.info(f"**{len(officials)} autoridade(s)** encontrada(s). Extraindo eventos...")
+        total = len(officials)
+        st.info(f"**{total} autoridade(s)** encontrada(s). Extraindo eventos...")
 
         progress_bar = st.progress(0)
         status_text = st.empty()
-        per_official_expander = st.expander("Ver progresso por autoridade", expanded=False)
+        log_expander = st.expander("Ver progresso por autoridade", expanded=False)
         log_lines = []
+        log_placeholder = log_expander.empty()
 
-        for i, official in enumerate(officials):
-            nome = official.get("nome") or official.get("cargo", "—")
-            status_text.markdown(f"⏳ Processando **{nome}**... ({i+1}/{len(officials)})")
+        if data_alvo:
+            # ── Modo paralelo: filtra por data em cada thread ─────────────────
+            status_text.markdown(f"⚡ Buscando compromissos de **{data_alvo.strftime('%d/%m/%Y')}** em paralelo...")
+            concluidos_state = {"n": 0}
 
-            records = scrape_official(session, official, delay=delay)
-            all_records.extend(records)
+            def web_progress(nome, encontrados, concluidos, total_off):
+                concluidos_state["n"] = concluidos
+                icon = "📅" if encontrados else "·"
+                label = f"{icon} **{nome or '—'}**"
+                if encontrados:
+                    label += f" — {encontrados} compromisso(s)"
+                log_lines.append(label)
+                log_placeholder.markdown("\n\n".join(log_lines))
+                progress_bar.progress(concluidos / total_off)
+                status_text.markdown(
+                    f"⚡ Processando... ({concluidos}/{total_off}) — "
+                    f"{encontrados} compromisso(s) encontrado(s) até agora"
+                )
 
-            if records:
-                log_lines.append(f"✅ **{nome}** — {len(records)} eventos")
-            else:
-                log_lines.append(f"ℹ️ **{nome}** — sem agenda obrigatória")
+            all_records = scrape_officials_parallel(
+                officials,
+                target_date=data_alvo,
+                max_workers=6,
+                delay=0.3,
+                progress_cb=web_progress,
+            )
+            status_text.markdown(f"✅ Concluído! {len(all_records)} compromisso(s) encontrado(s) para {data_alvo.strftime('%d/%m/%Y')}.")
+        else:
+            # ── Modo sequencial: todos os eventos, arquivos individuais ────────
+            for i, official in enumerate(officials):
+                nome = official.get("nome") or official.get("cargo", "—")
+                status_text.markdown(f"⏳ Processando **{nome}**... ({i+1}/{total})")
 
-            with per_official_expander:
-                st.markdown("\n".join(log_lines))
+                records = scrape_official(session, official, delay=delay)
+                all_records.extend(records)
 
-            progress_bar.progress((i + 1) / len(officials))
+                icon = "✅" if records else "ℹ️"
+                label = f"{icon} **{nome}**"
+                if records:
+                    label += f" — {len(records)} eventos"
+                else:
+                    label += " — sem agenda obrigatória"
+                log_lines.append(label)
+                log_placeholder.markdown("\n\n".join(log_lines))
+                progress_bar.progress((i + 1) / total)
 
-        status_text.markdown(f"✅ Extração concluída!")
+            status_text.markdown("✅ Extração concluída!")
 
     # ── Modo URL direta ──────────────────────────────────────────────────────
     elif eagendas_url:
@@ -260,15 +292,20 @@ if executar:
         all_records = [r for r in all_records if r.get("tipo") != "Viagem SCDP"]
         st.caption(f"{before - len(all_records)} viagens SCDP excluídas")
 
-    if data_alvo:
+    if data_alvo and not govbr_url:
+        # Para URL direta e ID, o filtro ainda não foi aplicado — aplica agora
         total_antes = len(all_records)
         all_records = filter_by_date(all_records, data_alvo)
         label = "amanhã" if data_alvo == amanha else data_alvo.strftime("%d/%m/%Y")
         if all_records:
-            st.success(f"📅 {len(all_records)} compromisso(s) encontrado(s) para **{label}** (de {total_antes} eventos no total)")
+            st.success(f"📅 {len(all_records)} compromisso(s) para **{label}** (de {total_antes} eventos no total)")
         else:
             st.warning(f"Nenhum compromisso encontrado para **{label}**. A agenda pode ainda não ter sido publicada.")
             st.stop()
+    elif data_alvo and govbr_url and not all_records:
+        label = "amanhã" if data_alvo == amanha else data_alvo.strftime("%d/%m/%Y")
+        st.warning(f"Nenhum compromisso encontrado para **{label}**. A agenda pode ainda não ter sido publicada.")
+        st.stop()
 
     if not all_records:
         st.warning("Nenhum evento encontrado com os parâmetros informados.")
